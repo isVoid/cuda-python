@@ -148,6 +148,28 @@ class TestWindowsPythonArch:
 
 
 @pytest.mark.parametrize(
+    ("machine", "expected_arch"),
+    (
+        (0x8664, "x64"),
+        (0xAA64, "arm64"),
+    ),
+)
+@pytest.mark.agent_authored(model="gpt-5.6")
+def test_windows_machine_arch_uses_native_pe_machine(mocker, machine, expected_arch):
+    mocker.patch.object(windows_arch_mod, "_windows_native_machine", return_value=machine)
+
+    assert windows_arch_mod.windows_machine_arch() == expected_arch
+
+
+@pytest.mark.agent_authored(model="gpt-5.6")
+def test_windows_machine_arch_rejects_unknown_pe_machine(mocker):
+    mocker.patch.object(windows_arch_mod, "_windows_native_machine", return_value=0x014C)
+
+    with pytest.raises(RuntimeError, match=r"Unsupported native Windows PE machine type: 0x014c"):
+        windows_arch_mod.windows_machine_arch()
+
+
+@pytest.mark.parametrize(
     ("machine", "target_arch", "expected"),
     (
         (0x8664, "x64", True),

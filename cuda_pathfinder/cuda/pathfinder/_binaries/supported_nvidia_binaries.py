@@ -31,4 +31,13 @@ SITE_PACKAGES_BINDIRS = {
     "nsight-compute": (_NSIGHT_COMPUTE_BIN,),
 }
 
+# Names accepted by the public API that are not the installed executable name.
+WINDOWS_BINARY_ALIASES = {
+    "nsight-sys": "nsys",
+    "nsight-compute": "ncu",
+}
+
+# These utilities are not delivered for Windows by any supported CUDA Toolkit.
+WINDOWS_UNAVAILABLE_BINARIES = frozenset(("cuda-gdb", "cuda-gdbserver"))
+
 SUPPORTED_BINARIES_ALL = SUPPORTED_BINARIES = tuple(SITE_PACKAGES_BINDIRS.keys())

@@ -2,13 +2,18 @@
 # SPDX-License-Identifier: Apache-2.0
 
 import functools
+import importlib
 import os
+from typing import Any
 
 from cuda.pathfinder._binaries import supported_nvidia_binaries
 from cuda.pathfinder._utils.ctk_root_canary import CTK_ROOT_CANARY_ANCHOR_LIBNAMES
 from cuda.pathfinder._utils.env_vars import get_cuda_path_or_home
 from cuda.pathfinder._utils.find_sub_dirs import find_sub_dirs_all_sitepackages
 from cuda.pathfinder._utils.platform_aware import IS_WINDOWS
+from cuda.pathfinder._utils.windows_arch import windows_machine_arch
+
+_NSIGHT_REGISTRY_ROOT = r"SOFTWARE\NVIDIA Corporation\Installed Products\Nsight"
 
 
 class UnsupportedBinaryError(Exception):
@@ -36,14 +41,59 @@ def _is_executable_candidate(path: str) -> bool:
     return os.access(path, os.X_OK)
 
 
-def _ctk_bin_subdirs(root: str) -> list[str]:
+def _ctk_bin_subdirs(root: str, utility_name: str) -> list[str]:
     if IS_WINDOWS:
+        if utility_name == "compute-sanitizer":
+            return [os.path.join(root, "compute-sanitizer")]
         return [
             os.path.join(root, "bin", "x64"),
             os.path.join(root, "bin", "x86_64"),
             os.path.join(root, "bin"),
         ]
     return [os.path.join(root, "bin")]
+
+
+def _windows_installed_nsight_root(product: str) -> str | None:
+    """Return the active Nsight product installation recorded by its MSI."""
+    # ``winreg`` attributes are absent from the type stubs on non-Windows hosts.
+    winreg: Any = importlib.import_module("winreg")
+
+    access = winreg.KEY_READ | winreg.KEY_WOW64_64KEY
+    product_key_path = rf"{_NSIGHT_REGISTRY_ROOT}\{product}"
+    try:
+        with winreg.OpenKey(winreg.HKEY_LOCAL_MACHINE, product_key_path, 0, access) as product_key:
+            current_version, _ = winreg.QueryValueEx(product_key, "CurrentVersion")
+            if not isinstance(current_version, str) or not current_version:
+                raise RuntimeError(f"Invalid CurrentVersion value in {product_key_path!r}")
+            with winreg.OpenKey(product_key, current_version, 0, access) as version_key:
+                install_root, _ = winreg.QueryValueEx(version_key, None)
+    except FileNotFoundError:
+        return None
+
+    if not isinstance(install_root, str) or not install_root:
+        raise RuntimeError(f"Invalid installation directory for {product_key_path!r} version {current_version!r}")
+    return install_root
+
+
+def _find_installed_nsys() -> str | None:
+    install_root = _windows_installed_nsight_root("Systems")
+    if install_root is None:
+        return None
+
+    target_dir = {
+        "x64": "target-windows-x64",
+        "arm64": "target-windows-armv8",
+    }[windows_machine_arch()]
+    return _resolve_in_trusted_dirs("nsys.exe", [os.path.join(install_root, target_dir)])
+
+
+def _find_installed_ncu() -> str | None:
+    install_root = _windows_installed_nsight_root("Compute")
+    if install_root is None:
+        return None
+
+    # The installer-generated wrapper selects the package's native target.
+    return _resolve_in_trusted_dirs("ncu.bat", [install_root])
 
 
 def _resolve_ctk_root_via_canary() -> str | None:
@@ -100,15 +150,21 @@ def find_nvidia_binary_utility(utility_name: str) -> str | None:
              environment variable, which use platform-specific bin directory
              layouts (``Library/bin`` on Windows, ``bin`` on Linux).
 
-        3. **CUDA Toolkit environment variables**
+        3. **Windows Nsight installations**
+
+           - On Windows, locate Nsight Systems and Nsight Compute from their
+             installer registry entries. Nsight Systems selects the executable
+             matching the native machine architecture.
+
+        4. **CUDA Toolkit environment variables**
 
            - Use ``CUDA_HOME`` or ``CUDA_PATH`` (in that order), searching
              ``bin/x64``, ``bin/x86_64``, and ``bin`` subdirectories on Windows,
              or just ``bin`` on Linux.
 
-        4. **CTK-root canary fallback**
+        5. **CTK-root canary fallback**
 
-           - Only when steps 1-3 miss: resolve the ``cudart`` library through the
+           - Only when steps 1-4 miss: resolve the ``cudart`` library through the
              OS dynamic loader, derive the CUDA Toolkit root from it, and search
              that root's bin layout.
 
@@ -132,6 +188,13 @@ def find_nvidia_binary_utility(utility_name: str) -> str | None:
     if utility_name not in supported_nvidia_binaries.SUPPORTED_BINARIES:
         raise UnsupportedBinaryError(utility_name)
 
+    if IS_WINDOWS and utility_name in supported_nvidia_binaries.WINDOWS_UNAVAILABLE_BINARIES:
+        return None
+
+    resolved_name = (
+        supported_nvidia_binaries.WINDOWS_BINARY_ALIASES.get(utility_name, utility_name) if IS_WINDOWS else utility_name
+    )
+
     # 1. Search in site-packages (NVIDIA wheels)
     candidate_dirs = supported_nvidia_binaries.SITE_PACKAGES_BINDIRS.get(utility_name, ())
     dirs = []
@@ -146,17 +209,26 @@ def find_nvidia_binary_utility(utility_name: str) -> str | None:
         else:
             dirs.append(os.path.join(conda_prefix, "bin"))
 
-    # 3. Search in CUDA Toolkit (CUDA_HOME/CUDA_PATH)
-    if (cuda_home := get_cuda_path_or_home()) is not None:
-        dirs.extend(_ctk_bin_subdirs(cuda_home))
+    normalized_name = _normalize_utility_name(resolved_name)
+    # Nsight tools are separately installed and are not located under CUDA_PATH.
+    if IS_WINDOWS and resolved_name in ("nsys", "ncu"):
+        found = _resolve_in_trusted_dirs(normalized_name, dirs)
+        if found is not None:
+            return found
+        if resolved_name == "nsys":
+            return _find_installed_nsys()
+        return _find_installed_ncu()
 
-    normalized_name = _normalize_utility_name(utility_name)
+    # 4. Search in CUDA Toolkit (CUDA_HOME/CUDA_PATH)
+    if (cuda_home := get_cuda_path_or_home()) is not None:
+        dirs.extend(_ctk_bin_subdirs(cuda_home, resolved_name))
+
     found = _resolve_in_trusted_dirs(normalized_name, dirs)
     if found is not None:
         return found
 
-    # 4. CTK-root canary fallback.
+    # 5. CTK-root canary fallback.
     ctk_root = _resolve_ctk_root_via_canary()
     if ctk_root is not None:
-        return _resolve_in_trusted_dirs(normalized_name, _ctk_bin_subdirs(ctk_root))
+        return _resolve_in_trusted_dirs(normalized_name, _ctk_bin_subdirs(ctk_root, resolved_name))
     return None

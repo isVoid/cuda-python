@@ -2,6 +2,7 @@
 # SPDX-License-Identifier: Apache-2.0
 
 import os
+import sys
 
 import pytest
 
@@ -126,6 +127,142 @@ def test_find_binary_windows_extension_and_search_dirs(monkeypatch, mocker):
     assert result is None
     find_sub_dirs_mock.assert_called_once_with(site_key.split(os.sep))
     assert checked == [os.path.join(d, "nvcc.exe") for d in expected_dirs]
+
+
+@pytest.mark.parametrize("utility_name", ("cuda-gdb", "cuda-gdbserver"))
+@pytest.mark.usefixtures("clear_find_binary_cache")
+@pytest.mark.agent_authored(model="gpt-5.6")
+def test_find_binary_ignores_windows_unavailable_utilities(monkeypatch, mocker, utility_name):
+    mocker.patch.object(binary_finder_module, "IS_WINDOWS", new=True)
+    find_site_packages = mocker.patch.object(binary_finder_module, "find_sub_dirs_all_sitepackages")
+    get_cuda_path = mocker.patch.object(binary_finder_module, "get_cuda_path_or_home")
+    monkeypatch.setenv("CONDA_PREFIX", os.path.join(os.sep, "conda"))
+
+    assert find_nvidia_binary_utility(utility_name) is None
+    find_site_packages.assert_not_called()
+    get_cuda_path.assert_not_called()
+
+
+@pytest.mark.parametrize(
+    ("utility_name", "finder_name"),
+    (
+        ("nsys", "_find_installed_nsys"),
+        ("nsight-sys", "_find_installed_nsys"),
+        ("ncu", "_find_installed_ncu"),
+        ("nsight-compute", "_find_installed_ncu"),
+    ),
+)
+@pytest.mark.usefixtures("clear_find_binary_cache")
+@pytest.mark.agent_authored(model="gpt-5.6")
+def test_find_binary_uses_windows_nsight_installation(monkeypatch, mocker, utility_name, finder_name):
+    expected = os.path.join(os.sep, "Program Files", utility_name)
+    mocker.patch.object(binary_finder_module, "IS_WINDOWS", new=True)
+    mocker.patch.object(binary_finder_module.supported_nvidia_binaries, "SITE_PACKAGES_BINDIRS", {})
+    installed_finder = mocker.patch.object(binary_finder_module, finder_name, return_value=expected)
+    get_cuda_path = mocker.patch.object(binary_finder_module, "get_cuda_path_or_home")
+    monkeypatch.delenv("CONDA_PREFIX", raising=False)
+
+    assert find_nvidia_binary_utility(utility_name) == expected
+    installed_finder.assert_called_once_with()
+    get_cuda_path.assert_not_called()
+
+
+@pytest.mark.parametrize(
+    ("machine_arch", "target_dir"),
+    (
+        ("x64", "target-windows-x64"),
+        ("arm64", "target-windows-armv8"),
+    ),
+)
+@pytest.mark.agent_authored(model="gpt-5.6")
+def test_find_installed_nsys_uses_machine_arch(mocker, machine_arch, target_dir):
+    install_root = os.path.join(os.sep, "Program Files", "Nsight Systems")
+    expected = os.path.join(install_root, target_dir, "nsys.exe")
+    mocker.patch.object(binary_finder_module, "_windows_installed_nsight_root", return_value=install_root)
+    machine_arch_mock = mocker.patch.object(binary_finder_module, "windows_machine_arch", return_value=machine_arch)
+    checked = _patch_exec_probe(mocker, existing=[expected])
+
+    assert binary_finder_module._find_installed_nsys() == os.path.abspath(expected)
+    machine_arch_mock.assert_called_once_with()
+    assert checked == [expected]
+
+
+@pytest.mark.agent_authored(model="gpt-5.6")
+def test_find_installed_ncu_uses_native_wrapper(mocker):
+    install_root = os.path.join(os.sep, "Program Files", "Nsight Compute")
+    expected = os.path.join(install_root, "ncu.bat")
+    mocker.patch.object(binary_finder_module, "_windows_installed_nsight_root", return_value=install_root)
+    checked = _patch_exec_probe(mocker, existing=[expected])
+
+    assert binary_finder_module._find_installed_ncu() == os.path.abspath(expected)
+    assert checked == [expected]
+
+
+@pytest.mark.agent_authored(model="gpt-5.6")
+def test_windows_installed_nsight_root_reads_64_bit_registry(mocker):
+    install_root = os.path.join(os.sep, "Program Files", "Nsight Systems")
+    product_key = mocker.MagicMock()
+    version_key = mocker.MagicMock()
+    product_context = mocker.MagicMock()
+    product_context.__enter__.return_value = product_key
+    version_context = mocker.MagicMock()
+    version_context.__enter__.return_value = version_key
+    winreg = mocker.MagicMock()
+    winreg.HKEY_LOCAL_MACHINE = object()
+    winreg.KEY_READ = 0x20019
+    winreg.KEY_WOW64_64KEY = 0x0100
+    winreg.OpenKey.side_effect = (product_context, version_context)
+    winreg.QueryValueEx.side_effect = (("2026.1.3", 1), (install_root, 1))
+    mocker.patch.dict(sys.modules, {"winreg": winreg})
+
+    assert binary_finder_module._windows_installed_nsight_root("Systems") == install_root
+    access = winreg.KEY_READ | winreg.KEY_WOW64_64KEY
+    winreg.OpenKey.assert_has_calls(
+        (
+            mocker.call(
+                winreg.HKEY_LOCAL_MACHINE,
+                rf"{binary_finder_module._NSIGHT_REGISTRY_ROOT}\Systems",
+                0,
+                access,
+            ),
+            mocker.call(product_key, "2026.1.3", 0, access),
+        )
+    )
+    winreg.QueryValueEx.assert_has_calls(
+        (
+            mocker.call(product_key, "CurrentVersion"),
+            mocker.call(version_key, None),
+        )
+    )
+
+
+@pytest.mark.agent_authored(model="gpt-5.6")
+def test_windows_installed_nsight_root_returns_none_when_absent(mocker):
+    winreg = mocker.MagicMock()
+    winreg.HKEY_LOCAL_MACHINE = object()
+    winreg.KEY_READ = 0x20019
+    winreg.KEY_WOW64_64KEY = 0x0100
+    winreg.OpenKey.side_effect = FileNotFoundError
+    mocker.patch.dict(sys.modules, {"winreg": winreg})
+
+    assert binary_finder_module._windows_installed_nsight_root("Systems") is None
+
+
+@pytest.mark.usefixtures("clear_find_binary_cache")
+@pytest.mark.agent_authored(model="gpt-5.6")
+def test_find_compute_sanitizer_uses_ctk_component_directory(monkeypatch, mocker):
+    cuda_home = os.path.join(os.sep, "cuda")
+    expected = os.path.join(cuda_home, "compute-sanitizer", "compute-sanitizer.exe")
+    mocker.patch.object(binary_finder_module, "IS_WINDOWS", new=True)
+    mocker.patch.object(binary_finder_module.supported_nvidia_binaries, "SITE_PACKAGES_BINDIRS", {})
+    mocker.patch.object(binary_finder_module, "get_cuda_path_or_home", return_value=cuda_home)
+    canary_mock = mocker.patch.object(binary_finder_module, "_resolve_ctk_root_via_canary")
+    monkeypatch.delenv("CONDA_PREFIX", raising=False)
+    checked = _patch_exec_probe(mocker, existing=[expected])
+
+    assert find_nvidia_binary_utility("compute-sanitizer") == os.path.abspath(expected)
+    assert checked == [expected]
+    canary_mock.assert_not_called()
 
 
 @pytest.mark.usefixtures("clear_find_binary_cache")

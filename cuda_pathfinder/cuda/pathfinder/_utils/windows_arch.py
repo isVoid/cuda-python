@@ -10,6 +10,8 @@ WINDOWS_PE_MACHINE_BY_ARCH = {
     "arm64": 0xAA64,
 }
 
+_WINDOWS_ARCH_BY_PE_MACHINE = {machine: arch for arch, machine in WINDOWS_PE_MACHINE_BY_ARCH.items()}
+
 
 class UnsupportedArchError(RuntimeError):
     """Raised when Python reports an unsupported Windows architecture."""
@@ -33,6 +35,42 @@ def windows_python_arch() -> str:
         return "x64"
 
     raise UnsupportedArchError(raw_platform_tag)
+
+
+def _windows_native_machine() -> int:
+    """Return the native Windows PE machine type, independent of process emulation."""
+    import ctypes
+    from ctypes import wintypes
+
+    # These ctypes attributes are absent from the type stubs on non-Windows hosts.
+    kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)  # type: ignore[attr-defined]
+    kernel32.GetCurrentProcess.restype = wintypes.HANDLE
+    is_wow64_process2 = kernel32.IsWow64Process2
+    is_wow64_process2.argtypes = (
+        wintypes.HANDLE,
+        ctypes.POINTER(wintypes.USHORT),
+        ctypes.POINTER(wintypes.USHORT),
+    )
+    is_wow64_process2.restype = wintypes.BOOL
+
+    process_machine = wintypes.USHORT()
+    native_machine = wintypes.USHORT()
+    if not is_wow64_process2(
+        kernel32.GetCurrentProcess(),
+        ctypes.byref(process_machine),
+        ctypes.byref(native_machine),
+    ):
+        raise ctypes.WinError(ctypes.get_last_error())  # type: ignore[attr-defined]
+    return native_machine.value
+
+
+def windows_machine_arch() -> str:
+    """Return the native Windows machine architecture, ignoring process emulation."""
+    native_machine = _windows_native_machine()
+    try:
+        return _WINDOWS_ARCH_BY_PE_MACHINE[native_machine]
+    except KeyError:
+        raise RuntimeError(f"Unsupported native Windows PE machine type: 0x{native_machine:04x}") from None
 
 
 def windows_pe_matches_arch(path: str, target_arch: str) -> bool:
